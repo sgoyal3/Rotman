@@ -4,7 +4,7 @@ import logging
 
 
 def check_case_status():
-    resp = SESSION.get('http://localhost:{}/v1/case')
+    resp = SESSION.get('http://localhost:{}/v1/case'.format(PORT))
     if resp.status_code == 200:
         status = resp.json()["status"]
         if status == "ACTIVE":
@@ -171,21 +171,20 @@ class OrderBook:
     # this only updates order info for the specified ticker!
     def updateMarketBook(self, ticker):
         assert self.bookType == "MARKET"
+        assert ticker in self.tickers
 
-        if ticker not in self.tickers:
-            print("Check Ticker!")
-            return
         resp = SESSION.get(
             'http://localhost:{}/v1/securities/book?ticker={}&limit={}'.format(
                 PORT, ticker, self.record_limit))
 
         if resp.status_code == 200:
-            # update lag_order book and clear out prev records
+            # create a new dict
             self.orderBook[ticker] = dict.fromkeys(self.actions)
             content = resp.json()
             # check BUY / SELL
             for order_type in self.actions:
-                if len(content[order_type]) == 0:
+                json_order_type = "bids" if order_type == "BUY" else "asks"
+                if len(content[json_order_type]) == 0:
                     continue
                 # maintain a list of length self.size
                 self.orderBook[ticker][order_type] = []
@@ -193,7 +192,7 @@ class OrderBook:
 
                 # price we maintain in order book (the first min(book_size, entry_size) entries)
                 # sorted in logical order!
-                price_arr = list(dict.fromkeys([item["price"] for item in content[order_type]]))[
+                price_arr = list(dict.fromkeys([item["price"] for item in content[json_order_type]]))[
                     :self.bookSize]
                 best_price = price_arr[0]
 
@@ -203,7 +202,7 @@ class OrderBook:
                     p - best_price) < self.spread_threshold]
                 worst_price = price_arr[-1]
 
-                for order in content[order_type]:
+                for order in content[json_order_type]:
                     # filter out our orders
                     if order['trader_id'] == self.trader_id:
                         continue
@@ -295,12 +294,15 @@ class OrderBook:
             vwap_ask /= volume_ask
             vwap_bid /= volume_bid
 
-            self.best_bid_arr.append(self.orderBook["RITC"]["BUY"][0].price)
-            self.best_ask_arr.append(self.orderBook["RITC"]["SELL"][0].price)
-            self.volume_bid_arr.append(volume_bid)
-            self.volume_ask_arr.append(volume_ask)
-            self.vwap_bid_arr.append(vwap_bid)
-            self.vwap_ask_arr.append(vwap_ask)
+            try:
+                self.best_bid_arr.append(self.orderBook["RITC"]["BUY"][0].price)
+                self.best_ask_arr.append(self.orderBook["RITC"]["SELL"][0].price)
+                self.volume_bid_arr.append(volume_bid)
+                self.volume_ask_arr.append(volume_ask)
+                self.vwap_bid_arr.append(vwap_bid)
+                self.vwap_ask_arr.append(vwap_ask)
+            except IndexError:
+                return
 
     # Statistics functions
 
@@ -338,7 +340,6 @@ class OrderBook:
 
     def get_RITC_trailing_stat(self, hist_len=20):
         assert self.bookType == "MARKET"
-
         if len(self.volume_bid_arr) < hist_len:
             return None
         output = {}
@@ -465,7 +466,7 @@ class PositionManager:
             if not self.try_arbitrage(size, sell=sell):
                 if not self.try_converter(sell=sell):
                     order_size = min(self.market_sizing(sell=sell),
-                                     self.RITC_order_limit, np.abs(size / 4))
+                                     self.RITC_order_limit, np.abs(size / 3))
                     self.add_split_orders("RITC", num_splits=3, sell=sell, order_size=order_size)
             self.updatePositionBook("RITC")
             size = self.positionBook["RITC"]["position"]
@@ -645,7 +646,7 @@ class TenderManager:
                         if newOffer.price > MARKETBOOK.get_mid_price("RITC", vwap=True):
                             self.take_offer_and_hedge(newOffer)
                     # if receive offer but no opposite position to unwind
-                    # only front run if profitable
+                    # evaluate the profit and consider front run
                     else:
                         if self.evaluate_profitable_before_take(newOffer):
                             self.state = "FRONTRUN"
@@ -665,7 +666,7 @@ class TenderManager:
             self.last_tick_took = None
 
     def take_offer_and_hedge(self, offer):
-        resp = SESSION.post('http://localhost:{}/v1/tenders/'.format(
+        resp = SESSION.post('http://localhost:{}/v1/tenders?id={}'.format(
             PORT, self.offer.tender_id))
         if resp.status_code == 200:
             print("accepted tender {}!".format(self.offer))
@@ -680,6 +681,9 @@ class TenderManager:
         # by default 20 data points
         trailing_stat = MARKETBOOK.get_RITC_trailing_stat()
         profit_flag = False
+        # if data is not enough, be aggressive
+        if trailing_stat is None:
+            return True
         # if the agent wants to sell to you
         if offer.action == 'BUY':
             ideal_bid_price = trailing_stat["vwap_mid_avg"] - \
@@ -689,8 +693,7 @@ class TenderManager:
                            offer.quantity <= ask_volume * self.volume_threshold)
         else:
             ideal_ask_price = trailing_stat["vwap_mid_avg"] + \
-                trailing_stat[
-                "vwap_mid_vol"] * self.volatility_mult_before
+                trailing_stat["vwap_mid_vol"] * self.volatility_mult_before
             bid_volume = MARKETBOOK.volume_bid_arr[-1]
             profit_flag = (offer.price >= ideal_ask_price and
                            offer.quantity <= bid_volume * self.volume_threshold)
@@ -701,16 +704,18 @@ class TenderManager:
         POSITION_MANAGER.updatePositionBook("RITC")
         size_if_take = offer.quantity + POSITION_MANAGER.get_position("RITC")
         # if the position is way too large, try front run more
-        if size_if_take > POSITION_MANAGER.trade_position_limit:
+        if size_if_take > POSITION_MANAGER.tender_position_limit:
+            tgt_quantity = int(offer.quantity / 2)
+        elif size_if_take > POSITION_MANAGER.trade_position_limit:
             tgt_quantity = int(offer.quantity / 3)
         else:
-            tgt_quantity = int(offer.quantity / 5)
+            tgt_quantity = int(offer.quantity / 4)
         if offer.action == "BUY":
             POSITION_MANAGER.add_split_orders("RITC", sell=True,
-                                              num_splits=4, order_size=tgt_quantity)
+                                              num_splits=3, order_size=tgt_quantity)
         else:
             POSITION_MANAGER.add_split_orders("RITC", sell=False,
-                                              num_splits=4, order_size=tgt_quantity)
+                                              num_splits=3, order_size=tgt_quantity)
 
     # update both market book and trader book when calling this!
     # evaluate profitable:
@@ -758,8 +763,7 @@ class TenderManager:
                     unfilled_orders <= offer.quantity * move_against_threshold:
                 self.take_offer_and_hedge(offer)
                 # unwind position
-                POSITION_MANAGER.cancel_bad_orders("RITC", "BUY",
-                                             spread_threshold=0.03)
+                POSITION_MANAGER.cancel_bad_orders("RITC", "BUY", spread_threshold=0.03)
                 POSITION_MANAGER.unwind_position(sell=False)
             else:
                 # if price is ok, but no liquidity, then do nothing
@@ -769,13 +773,12 @@ class TenderManager:
 
 
 # Main Function
-API_KEY = {'X-API-key': 'LBFAK2UH'}
+API_KEY = {'X-API-key': 'FWJX3L79'}
 PORT = "9999"
 
 # use global variable in all functions
 with requests.Session() as SESSION:
     SESSION.headers.update(API_KEY)
-
 MARKETBOOK = OrderBook("MARKET", size=5)
 TRADERBOOK = OrderBook("TRADER", size=5)
 POSITION_MANAGER = PositionManager()
@@ -792,7 +795,7 @@ while get_tick() < 300:
     # Tender Offer First
     TENDER.handle_offer()
     # check if need to unwind position
-    curr_position = POSITION_MANAGER.get_position("RTIC")
+    curr_position = POSITION_MANAGER.get_position("RITC")
 
     # Market Making
     # use VB and FB as signals
@@ -810,10 +813,10 @@ while get_tick() < 300:
             # cancel Sell orders and submit new Buy orders
             POSITION_MANAGER.cancel_bad_orders(
                 "RITC", sell=True, close_to_best=True, spread_threshold=0.03)
-            POSITION_MANAGER.add_split_orders("RTIC", num_splits=3, sell=False)
+            POSITION_MANAGER.add_split_orders("RITC", num_splits=3, sell=False)
 
     if curr_position > -POSITION_MANAGER.ideal_position_limit:
         if VB < -0.3 or FB < -5000:
             POSITION_MANAGER.cancel_bad_orders(
                 "RITC", sell=False, close_to_best=True, spread_threshold=0.03)
-            POSITION_MANAGER.add_split_orders("RTIC", num_splits=3, sell=True)
+            POSITION_MANAGER.add_split_orders("RITC", num_splits=3, sell=True)
